@@ -1,56 +1,176 @@
 const fs = require('fs');
 const path = require('path');
-const glob = require('glob');
+const { glob } = require('glob');
 const sqlFormatter = require('sql-formatter');
 
+console.log("Iniciando processamento...");
+
 // Configurações
-const EXTENSIONS_RELEVANTES = ['.sql', '.java', '.js']; // Extensões de arquivos a serem considerados
-const DELIMITADOR = '---\n'; // Delimitador para separar as queries no console
+const EXTENSIONS_RELEVANTES = ['.sql', '.java', '.js', '.py'];
+const OUTPUT_DIR = './queries_extraidas';
+const DELIMITADOR = '---\n';
 
-// Função para identificar e extrair queries SQL de um arquivo
-function extrairQueriesDoArquivo(caminhoArquivo) {
-    const conteudo = fs.readFileSync(caminhoArquivo, 'utf8');
-    const padraoQuerySQL = /(?:"[^"]*"|'[^']*'|\+|\s)*((?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)[\s\S]*?)(?=;|$)/gi;
-    let queries = [];
-    let match;
+// Configuração do dialecto SQL
+const dialecto = {
+    language: 'mysql', // Altere para 'mysql', 'sqlite', etc., conforme necessário
+    tabWidth: 4,
+    linesBetweenQueries: 2
+};
 
-    // Encontra todas as queries SQL no arquivo
-    while ((match = padraoQuerySQL.exec(conteudo)) !== null) {
-        let query = match[1].replace(/\s*\+\s*/g, ' '); // Remove concatenações com +
-        queries.push(query);
+// Função para sanitizar nomes de arquivo
+function sanitizarNome(nome) {
+    return nome.replace(/[^a-zA-Z0-9_]/g, '_').substring(0, 50);
+}
+
+// Função para extrair informações de função baseada no idioma
+function extrairFuncaoEComentario(conteudo, extensao) {
+    let funcoes = [];
+    
+    switch (extensao) {
+        case '.java':
+            const regexJava = /(\/\*\*[\s\S]*?\*\/)?\s*((?:public|private|protected|static|final|abstract|synchronized)\s+)*([\w<>]+)\s+(\w+)\s*\([^)]*\)\s*\{/g;
+            let matchJava;
+            while ((matchJava = regexJava.exec(conteudo)) !== null) {
+                funcoes.push({
+                    comentario: matchJava[1] ? matchJava[1].replace(/\/\*\*|\*\//g, '').replace(/^\s*\*\s?/gm, '').trim() : '',
+                    nome: matchJava[4] // Nome do método agora está no grupo 4
+                });
+            }
+            break;
+
+        case '.js':
+            const regexJS = /(\/\*\*[\s\S]*?\*\/)?\s*(function\s+(\w+)|const\s+(\w+)\s*=\s*\([^)]*\)\s*=>)/g;
+            let matchJS;
+            while ((matchJS = regexJS.exec(conteudo)) !== null) {
+                funcoes.push({
+                    comentario: matchJS[1] ? matchJS[1].replace(/\/\*\*|\*\//g, '').replace(/^\s*\*\s?/gm, '').trim() : '',
+                    nome: matchJS[3] || matchJS[4]
+                });
+            }
+            break;
+
+        case '.py':
+            const regexPython = /def\s+(\w+)\s*\(.*?\):\s*("""[\s\S]*?"""|'''[\s\S]*?''')?/g;
+            let matchPython;
+            while ((matchPython = regexPython.exec(conteudo)) !== null) {
+                funcoes.push({
+                    comentario: matchPython[2] ? matchPython[2].replace(/"""|'''/g, '').trim() : '',
+                    nome: matchPython[1]
+                });
+            }
+            break;
     }
 
-    return queries;
+    return funcoes.length > 0 ? funcoes[funcoes.length - 1] : { nome: 'Global', comentario: '' };
 }
 
-// Função para formatar e exibir as queries SQL
-function formatarEExibirQueries(queries) {
-    queries.forEach(query => {
-        const queryFormatada = sqlFormatter.format(query);
-        console.log(queryFormatada);
-        console.log(DELIMITADOR);
-    });
+// Função para pré-processar e limpar a query
+function preProcessarQuery(query) {
+    // Remove trechos problemáticos com """
+    query = query.replace(/"{3}[\s\S]*?"{3}/g, '');
+    
+    // Remove concatenações e espaços complexos
+    query = query
+        .replace(/"\s*\+\s*"/g, ' ') // Concatenação de strings
+        .replace(/\s*\\n\s*/g, ' ') // Quebras de linha escapadas
+        .replace(/\s+/g, ' ') // Espaços múltiplos
+        .trim();
+
+    // Filtra caracteres inválidos
+    return query.replace(/[^\w\s\(\)\.,=*<>!@#\$%\^&\[\]{};:?\-]/g, '');
 }
 
-// Função principal para varrer o repositório
-function varrerRepositorio(diretorio) {
-    const padraoArquivos = `**/*{${EXTENSIONS_RELEVANTES.join(',')}}`;
-    glob(path.join(diretorio, padraoArquivos), (erro, arquivos) => {
-        if (erro) {
-            console.error('Erro ao varrer o repositório:', erro);
-            return;
-        }
+// Função para validar a query
+function validarQuery(query) {
+    const palavrasChaveValidas = [
+        'SELECT', 'INSERT', 'UPDATE', 'DELETE', 
+        'CREATE', 'ALTER', 'DROP', 'FROM', 
+        'WHERE', 'JOIN', 'INTO', 'VALUES'
+    ];
 
-        arquivos.forEach(arquivo => {
-            const queries = extrairQueriesDoArquivo(arquivo);
-            if (queries.length > 0) {
-                console.log(`Queries encontradas no arquivo: ${arquivo}`);
-                formatarEExibirQueries(queries);
+    return palavrasChaveValidas.some(palavra => 
+        query.toUpperCase().includes(palavra)
+    );
+}
+
+// Função para extrair queries com contexto
+function extrairQueriesComContexto(caminhoArquivo) {
+    try {
+        const conteudo = fs.readFileSync(caminhoArquivo, 'utf8');
+        const extensao = path.extname(caminhoArquivo);
+        const padraoSQL = /((?:"{3}[\s\S]*?"{3})?((?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\s[\s\S]*?)(?=;|$))/gi;
+        
+        return Array.from(conteudo.matchAll(padraoSQL))
+            .map(match => {
+                const contextoAnterior = conteudo.substring(0, match.index);
+                const { nome, comentario } = extrairFuncaoEComentario(contextoAnterior, extensao);
+                const queryBruta = match[2] || match[1];
+                
+                return {
+                    query: preProcessarQuery(queryBruta),
+                    funcao: nome,
+                    descricao: comentario
+                };
+            })
+            .filter(({ query }) => validarQuery(query)); // Filtra queries inválidas
+    } catch (erro) {
+        console.error(`Erro no arquivo ${caminhoArquivo}: ${erro.message}`);
+        return [];
+    }
+}
+
+// Função para salvar queries em arquivos
+async function salvarQueries(queries) {
+    if (!fs.existsSync(OUTPUT_DIR)) {
+        fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    }
+
+    const contador = new Map();
+    
+    for (const { query, funcao, descricao } of queries) {
+        try {
+            const nomeBase = sanitizarNome(funcao);
+            let contagem = contador.get(nomeBase) || 1;
+            
+            while (fs.existsSync(path.join(OUTPUT_DIR, `${nomeBase}_${contagem}.sql`))) {
+                contagem++;
             }
-        });
-    });
+            
+            const nomeArquivo = `${nomeBase}_${contagem}.sql`;
+            const conteudoArquivo = `-- Função: ${funcao}\n-- Descrição: ${descricao || 'Sem descrição'}\n\n${
+                sqlFormatter.format(query, dialecto) // Usa dialecto específico
+            }\n`;
+            
+            fs.writeFileSync(path.join(OUTPUT_DIR, nomeArquivo), conteudoArquivo);
+            contador.set(nomeBase, contagem + 1);
+        } catch (erro) {
+            console.error(`Query inválida na função ${funcao}: ${erro.message}`);
+        }
+    }
 }
 
-// Ponto de entrada do script
-const DIRETORIO_REPOSITORIO = './caminho/do/repositorio'; // Substitua pelo caminho do repositório
-varrerRepositorio(DIRETORIO_REPOSITORIO);
+// Função principal
+async function processarRepositorio(diretorio) {
+    try {
+        const arquivos = await glob(`${diretorio}/**/*.{${EXTENSIONS_RELEVANTES.map(e => e.substring(1)).join(',')}}`, { nodir: true });
+        const todasQueries = [];
+        
+        for (const arquivo of arquivos) {
+            const queries = extrairQueriesComContexto(arquivo);
+            if (queries.length > 0) {
+                console.log(`Encontradas ${queries.length} queries em: ${arquivo}`);
+                todasQueries.push(...queries);
+            }
+        }
+        
+        await salvarQueries(todasQueries);
+        console.log(`Processamento completo! Arquivos salvos em: ${path.resolve(OUTPUT_DIR)}`);
+        
+    } catch (erro) {
+        console.error(`Erro geral: ${erro.message}`);
+    }
+}
+
+// Execução
+const DIRETORIO_REPOSITORIO = '../GitHub/OrdemDeServico/dao'; // Substitua pelo caminho do repositório
+processarRepositorio(DIRETORIO_REPOSITORIO);
